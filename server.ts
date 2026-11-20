@@ -2,10 +2,15 @@
  * Domino Sky — Full-Stack Server Entry Point (Port 3000)
  *
  * Serves:
- *  - GET /api/health             : Runtime health check
- *  - GET /api/dataset            : Server-validated official flight_network.json
- *  - GET /api/dispatcher/status  : Server-side Gemini dispatcher availability (never exposes API keys)
- *  - POST /api/dispatcher/recommend : Reserved for Phase 4 Gemini AI dispatcher endpoint
+ *  - GET  /api/health              : Runtime health check
+ *  - GET  /api/dataset             : Server-validated official flight_network.json
+ *  - POST /api/simulate            : Deterministic disruption simulation
+ *  - POST /api/recovery/candidates : Deterministic recovery candidate generation + rejected diagnostics
+ *  - POST /api/recovery/evaluate   : Re-simulate & compare a single selected recovery candidate
+ *  - POST /api/recovery/compare    : Re-simulate & compare multiple recovery candidates side-by-side
+ *  - POST /api/recovery/ranked     : Generate, re-simulate, and transparently rank all feasible options
+ *  - GET  /api/dispatcher/status   : Server-side Gemini dispatcher availability (never exposes API keys)
+ *  - POST /api/dispatcher/recommend: Reserved for Phase 4 Gemini AI dispatcher endpoint
  *  - Vite dev middleware (development) or static dist/ bundle (production)
  */
 
@@ -14,11 +19,16 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { RawFlightNetworkDataset } from './src/types/dataset.ts';
-import type { SimulationConfig } from './src/types/simulation.ts';
+import type { NormalizedFlightNetwork, RawFlightNetworkDataset } from './src/types/dataset.ts';
+import type { AirportClosureEvent, SimulationConfig } from './src/types/simulation.ts';
 import { normalizeFlightNetwork } from './src/engine/dataset/loader.ts';
 import { createAirportClosureEvent } from './src/engine/closure/index.ts';
 import { simulateDisruption } from './src/engine/propagation/index.ts';
+import {
+  evaluateRecoveryCandidate,
+  generateAndRankRecoveryOptions,
+  generateRecoveryCandidates,
+} from './src/engine/recovery/index.ts';
 import { isValidHHMM, parseHHMMToMinutes } from './src/engine/time.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -31,10 +41,50 @@ const DATASET_PATH = path.resolve(
 );
 const PLANNED_GEMINI_MODEL = 'gemini-4-hydrogen';
 
+interface ScenarioRequestBody {
+  airportId?: string | null;
+  startTime?: string;
+  startMin?: number;
+  durationMinutes?: number;
+  reason?: string;
+  config?: Partial<SimulationConfig>;
+}
+
 function loadValidatedDatasetFromDisk() {
   const rawText = fs.readFileSync(DATASET_PATH, 'utf-8');
   const raw = JSON.parse(rawText) as RawFlightNetworkDataset;
   return normalizeFlightNetwork(raw);
+}
+
+function parseClosureFromBody(
+  network: NormalizedFlightNetwork,
+  body: ScenarioRequestBody
+): AirportClosureEvent | null {
+  if (!body.airportId) {
+    return null;
+  }
+
+  let startMin: number;
+  if (typeof body.startMin === 'number' && Number.isFinite(body.startMin)) {
+    startMin = body.startMin;
+  } else if (typeof body.startTime === 'string' && isValidHHMM(body.startTime)) {
+    startMin = parseHHMMToMinutes(body.startTime);
+  } else {
+    throw new Error('Provide a valid 24-hour HH:MM startTime or integer startMin.');
+  }
+
+  const durationMinutes = Number(body.durationMinutes);
+  if (!Number.isFinite(durationMinutes) || durationMinutes <= 0) {
+    throw new Error('durationMinutes must be a positive number.');
+  }
+
+  return createAirportClosureEvent(
+    network,
+    body.airportId,
+    startMin,
+    durationMinutes,
+    body.reason
+  );
 }
 
 async function startServer() {
@@ -65,46 +115,141 @@ async function startServer() {
   app.post('/api/simulate', (req, res) => {
     try {
       const bundle = loadValidatedDatasetFromDisk();
-      const body = (req.body ?? {}) as {
-        airportId?: string | null;
-        startTime?: string;
-        startMin?: number;
-        durationMinutes?: number;
-        reason?: string;
-        config?: Partial<SimulationConfig>;
-      };
-
-      let closure = null;
-      if (body.airportId) {
-        let startMin: number;
-        if (typeof body.startMin === 'number' && Number.isFinite(body.startMin)) {
-          startMin = body.startMin;
-        } else if (typeof body.startTime === 'string' && isValidHHMM(body.startTime)) {
-          startMin = parseHHMMToMinutes(body.startTime);
-        } else {
-          res.status(400).json({ error: 'Provide a valid 24-hour HH:MM startTime or integer startMin.' });
-          return;
-        }
-
-        const durationMinutes = Number(body.durationMinutes);
-        if (!Number.isFinite(durationMinutes) || durationMinutes <= 0) {
-          res.status(400).json({ error: 'durationMinutes must be a positive number.' });
-          return;
-        }
-
-        closure = createAirportClosureEvent(
-          bundle.network,
-          body.airportId,
-          startMin,
-          durationMinutes,
-          body.reason
-        );
-      }
-
+      const body = (req.body ?? {}) as ScenarioRequestBody;
+      const closure = parseClosureFromBody(bundle.network, body);
       const result = simulateDisruption(bundle.network, closure, body.config);
       res.json(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Simulation failed.';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/recovery/candidates', (req, res) => {
+    try {
+      const bundle = loadValidatedDatasetFromDisk();
+      const body = (req.body ?? {}) as ScenarioRequestBody;
+      const closure = parseClosureFromBody(bundle.network, body);
+      const baseline = simulateDisruption(bundle.network, closure, body.config);
+      const { candidates, rejectedCandidates } = generateRecoveryCandidates(
+        bundle.network,
+        baseline
+      );
+      res.json({
+        scenarioId: baseline.scenarioId,
+        baselineKpis: baseline.kpis,
+        candidates,
+        rejectedCandidates,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Candidate generation failed.';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/recovery/evaluate', (req, res) => {
+    try {
+      const bundle = loadValidatedDatasetFromDisk();
+      const body = (req.body ?? {}) as ScenarioRequestBody & { actionId?: string };
+      if (!body.actionId || typeof body.actionId !== 'string') {
+        res.status(400).json({ error: 'actionId is required to evaluate a recovery candidate.' });
+        return;
+      }
+
+      const closure = parseClosureFromBody(bundle.network, body);
+      const baseline = simulateDisruption(bundle.network, closure, body.config);
+      const { candidates, rejectedCandidates } = generateRecoveryCandidates(
+        bundle.network,
+        baseline
+      );
+
+      const matchedFeasible = candidates.find((c) => c.actionId === body.actionId);
+      if (matchedFeasible) {
+        const comparison = evaluateRecoveryCandidate(bundle.network, baseline, matchedFeasible);
+        res.json({ comparison });
+        return;
+      }
+
+      const matchedRejected = rejectedCandidates.find((c) => c.actionId === body.actionId);
+      if (matchedRejected) {
+        res.status(422).json({
+          error: `Recovery action "${body.actionId}" is physically or legally infeasible.`,
+          action: matchedRejected,
+        });
+        return;
+      }
+
+      res.status(404).json({
+        error: `Unknown recovery actionId "${body.actionId}" for this scenario.`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Recovery evaluation failed.';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/recovery/compare', (req, res) => {
+    try {
+      const bundle = loadValidatedDatasetFromDisk();
+      const body = (req.body ?? {}) as ScenarioRequestBody & { actionIds?: string[] };
+      const closure = parseClosureFromBody(bundle.network, body);
+      const baseline = simulateDisruption(bundle.network, closure, body.config);
+      const { candidates, rejectedCandidates } = generateRecoveryCandidates(
+        bundle.network,
+        baseline
+      );
+
+      let selected = candidates;
+      if (Array.isArray(body.actionIds) && body.actionIds.length > 0) {
+        const missingIds: string[] = [];
+        selected = [];
+        for (const id of body.actionIds) {
+          const found = candidates.find((c) => c.actionId === id);
+          if (!found) {
+            missingIds.push(id);
+          } else {
+            selected.push(found);
+          }
+        }
+        if (missingIds.length > 0) {
+          res.status(404).json({
+            error: `One or more requested actionIds are unknown or infeasible: ${missingIds.join(', ')}`,
+          });
+          return;
+        }
+      }
+
+      const comparisons = selected.map((candidate) =>
+        evaluateRecoveryCandidate(bundle.network, baseline, candidate)
+      );
+
+      res.json({
+        scenarioId: baseline.scenarioId,
+        baselineKpis: baseline.kpis,
+        comparisons,
+        rejectedCandidates,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Recovery comparison failed.';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/recovery/ranked', (req, res) => {
+    try {
+      const bundle = loadValidatedDatasetFromDisk();
+      const body = (req.body ?? {}) as ScenarioRequestBody;
+      const closure = parseClosureFromBody(bundle.network, body);
+      const baseline = simulateDisruption(bundle.network, closure, body.config);
+      const ranked = generateAndRankRecoveryOptions(bundle.network, baseline);
+      res.json({
+        scenarioId: baseline.scenarioId,
+        baselineKpis: baseline.kpis,
+        rankedOptions: ranked.rankedOptions,
+        rejectedCandidates: ranked.rejectedCandidates,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Recovery ranking failed.';
       res.status(400).json({ error: message });
     }
   });
@@ -124,7 +269,7 @@ async function startServer() {
   app.post('/api/dispatcher/recommend', (_req, res) => {
     res.status(501).json({
       error:
-        'AI dispatcher recommendations are scheduled for Phase 4 after the deterministic propagation and recovery engines are implemented.',
+        'AI dispatcher recommendations are scheduled for Phase 4 after the deterministic recovery engine is verified.',
     });
   });
 

@@ -9,4 +9,5 @@ export * from './rotation/index.ts';
 export * from './passenger/index.ts';
 export * from './crew/index.ts';
 export * from './recovery/index.ts';
+export * from './recovery/ranking.ts';
 export * from './comparison/index.ts';

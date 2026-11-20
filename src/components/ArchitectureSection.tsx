@@ -65,17 +65,17 @@ const ARCHITECTURE_MODULES: ModuleBlueprint[] = [
     step: '07',
     name: 'Recovery Action Simulation',
     authority: 'Deterministic Engine',
-    status: 'Interface Defined (Next Phase)',
+    status: 'Implemented & Verified',
     responsibility:
-      'Generates physically legal recovery candidates (spare deployment, chain cancellation, connection hold, tail swap) and re-simulates each deterministically.',
+      'Generates physically legal recovery candidates (spare deployment, chain cancellation, tail swap, controlled hold), re-simulates each deterministically, and ranks with transparent multi-criteria scores.',
   },
   {
     step: '08',
     name: 'Before-and-After Comparison',
     authority: 'Deterministic Engine',
-    status: 'Interface Defined (Next Phase)',
+    status: 'Implemented & Verified',
     responsibility:
-      'Produces exact KPI deltas, improved/worsened flights, resolved crew violations, and saved passenger connections between baseline and recovery runs.',
+      'Produces exact KPI deltas, 5-category flight diffs, improved/worsened/unchanged metrics, resolved crew violations, saved connections, and deterministic trade-offs.',
   },
   {
     step: '09',

@@ -330,17 +330,23 @@ export interface RecoveryAction {
   type: RecoveryActionType;
   label: string;
   description: string;
+  /** Deterministic reason why the candidate generator proposed this recovery option */
+  generationReason: string;
   /** Primary target flight(s), spare tail, or connection depending on action type */
   parameters: {
     spareTailId?: string;
     targetFlightId?: string;
+    /** Explicit list of flights reassigned to a spare or swapped tail */
+    reassignedFlightIds?: string[];
     /** Explicit list of flights cancelled together (e.g. out-and-back pair or remaining chain) */
     cancelledFlightIds?: string[];
     targetTailId?: string;
     secondaryTailId?: string;
     secondaryFlightId?: string;
+    secondaryReassignedFlightIds?: string[];
     connectionId?: string;
     holdMinutes?: number;
+    holdTargetDepMin?: number;
   };
   /** True only when EVERY required physical and crew feasibility check passes */
   isFeasible: boolean;
@@ -395,24 +401,121 @@ export interface SimulationResult {
   }>;
 }
 
+export type FlightRecoveryOutcome =
+  | 'recovered'
+  | 'delay_reduced'
+  | 'delay_increased'
+  | 'cancelled_for_recovery'
+  | 'unaffected';
+
+export interface FlightRecoveryDiff {
+  flightId: string;
+  tailBefore: string;
+  tailAfter: string;
+  route: string;
+  baselineStatus: FlightOperationalStatus;
+  recoveredStatus: FlightOperationalStatus;
+  baselineArrivalDelayMin: number;
+  recoveredArrivalDelayMin: number;
+  arrivalDelayDeltaMin: number;
+  outcome: FlightRecoveryOutcome;
+}
+
+export interface MetricDeltaRecord {
+  metric: keyof NetworkKpiSnapshot;
+  label: string;
+  unit: string;
+  before: number;
+  after: number;
+  /** after - before (negative is better for delays, cancellations, stranded pax, crew breaches) */
+  delta: number;
+  direction: 'improved' | 'worsened' | 'unchanged';
+}
+
 export interface RecoveryComparison {
   baseline: SimulationResult;
   recovered: SimulationResult;
   appliedAction: RecoveryAction;
+  feasibilityStatus: {
+    isFeasible: boolean;
+    reason: string;
+    checks: RecoveryFeasibilityCheck[];
+    usesAssumedStandbyCrew: boolean;
+  };
   deltas: {
     delayedFlightsDelta: number;
     cancelledFlightsDelta: number;
     totalDelayMinutesDelta: number;
+    averageDelayMinutesDelta: number;
+    maxDelayMinutesDelta: number;
     missedConnectionsDelta: number;
     missedConnectionPaxDelta: number;
     cancelledFlightPaxDelta: number;
+    cancelledConnectionOverlapPaxDelta: number;
     totalStrandedPaxDelta: number;
     crewViolationsDelta: number;
+    maxCrewOverageMinsDelta: number;
   };
+  improvedMetrics: MetricDeltaRecord[];
+  worsenedMetrics: MetricDeltaRecord[];
+  unchangedMetrics: MetricDeltaRecord[];
+  operationalTradeoffs: string[];
+  flightDiffs: FlightRecoveryDiff[];
+  /** Flights delayed in baseline that became on_time after recovery */
+  recoveredFlightIds: string[];
+  /** Flights still delayed in recovery, but with strictly lower arrival delay */
+  delayReducedFlightIds: string[];
+  /** Flights with higher delay after recovery (including on_time -> delayed) */
+  delayIncreasedFlightIds: string[];
+  /** Flights operated in baseline that were cancelled as part of recovery */
+  cancelledForRecoveryFlightIds: string[];
+  /** Flights with identical status and identical arrival delay */
+  unaffectedFlightIds: string[];
+  /** Convenience union: recoveredFlightIds + delayReducedFlightIds */
   improvedFlightIds: string[];
+  /** Convenience union: delayIncreasedFlightIds + cancelledForRecoveryFlightIds */
   worsenedFlightIds: string[];
   resolvedCrewViolationIds: string[];
   newlyCreatedCrewViolationIds: string[];
   savedConnectionIds: string[];
   lostConnectionIds: string[];
 }
+
+export type RankingCriterionId =
+  | 'feasibility_and_continuity'
+  | 'passenger_impact_reduction'
+  | 'total_delay_reduction'
+  | 'crew_duty_compliance'
+  | 'cancellation_avoidance';
+
+export interface RankingCriterionScore {
+  id: RankingCriterionId;
+  label: string;
+  priorityRank: 1 | 2 | 3 | 4 | 5;
+  /** Explicit weight in the deterministic composite score (0..1 for scored criteria; gate for feasibility) */
+  weight: number;
+  rawMetricSummary: string;
+  /** Normalized transparent score on [-100, +100] */
+  criterionScore: number;
+  weightedContribution: number;
+  explanation: string;
+}
+
+export interface RecoveryRankingBreakdown {
+  totalScore: number;
+  criteria: RankingCriterionScore[];
+  tradeoffSummary: string[];
+}
+
+export interface RankedRecoveryOption {
+  rank: number;
+  action: RecoveryAction;
+  comparison: RecoveryComparison;
+  ranking: RecoveryRankingBreakdown;
+}
+
+export interface CandidateGenerationOutput {
+  candidates: RecoveryAction[];
+  rejectedCandidates: RecoveryAction[];
+}
+

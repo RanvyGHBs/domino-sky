@@ -1,15 +1,16 @@
 /**
  * Module 3: Flight Scheduling & Deterministic Delay Propagation Engine
  *
- * Chronologically simulates all 70 scheduled flights across 16 aircraft rotations:
+ * Chronologically simulates all 70 scheduled flights across aircraft rotations:
  * - Evaluates airport closures strictly against actual departure & arrival timelines.
  * - Enforces the half-open closure interval [startMin, endMin) with zero movements inside.
  * - Distinguishes origin ground hold, destination GDP hold, airborne arrival holding,
  *   and reopening runway capacity metering (with deterministic queue ordering).
  * - Enforces minimum 30-minute turnaround, absorbs turnaround slack where available,
  *   and maintains strict physical aircraft location continuity (no aircraft teleporting).
- * - Integrates passenger connection analysis (21 official connections, no double-counting)
- *   and crew duty-time analysis (16 official crews, flag_violation default).
+ * - Supports deterministic schedule overrides for recovery actions (spare deployment,
+ *   cancellations, aircraft swaps, and controlled departure holds) via the exact same
+ *   simulation loop so baseline and recovery metrics are 100% consistent.
  */
 
 import type {
@@ -50,9 +51,24 @@ export interface DelayPropagationEngine {
   ): SimulatedFlightState[];
 }
 
+export interface CustomTailRotationPlan {
+  tailId: string;
+  isSpare: boolean;
+  startingAirportId: string;
+  availableFromMin: number;
+  legs: ScheduledFlight[];
+}
+
 export interface SimulationExecutionOptions {
-  /** Explicit set of flights cancelled prior to propagation (e.g., recovery action or continuity test) */
+  /** Explicit set of flights cancelled prior to propagation */
   preCancelledFlightIds?: ReadonlySet<string>;
+  /** Explicit controlled departure holds: flightId -> earliest allowed actual departure minute */
+  flightMinDepartureByFlightId?: Record<string, { minDepMin: number; reason: string; sourceRefId: string }>;
+  /**
+   * Optional custom per-tail rotation overrides (used by spare deployment and tail swap recovery).
+   * When omitted, uses the exact official dataset activeAircraft rotations.
+   */
+  customRotations?: CustomTailRotationPlan[];
   /** Recovery actions attached to this simulation run */
   appliedRecoveryActions?: RecoveryAction[];
   /** Custom scenario identifier */
@@ -61,6 +77,8 @@ export interface SimulationExecutionOptions {
 
 interface AircraftCursor {
   tailId: string;
+  isSpare: boolean;
+  availableFromMin: number;
   legs: ScheduledFlight[];
   nextIdx: number;
   currentPosition: string;
@@ -81,6 +99,8 @@ interface TentativeLegPlan {
   turnaroundSlackAbsorbedMin: number;
   readyDepMin: number;
   residualUpstreamDelayMin: number;
+  controlledHoldAddedMin: number;
+  controlledHoldInfo: { minDepMin: number; reason: string; sourceRefId: string } | null;
   closureEval: ClosureTimelineEvaluation;
   touchesReopenedOrigin: boolean;
   touchesReopenedDest: boolean;
@@ -107,7 +127,8 @@ function resolveSimulationConfig(
 
 function buildActiveAssumptionsList(
   closure: AirportClosureEvent | null,
-  config: SimulationConfig
+  config: SimulationConfig,
+  usesAssumedStandbyCrew: boolean
 ): string[] {
   const assumptions: string[] = [
     'Absolute-minute time axis from 00:00 IST (monotonic past midnight, formatted +1d).',
@@ -130,6 +151,12 @@ function buildActiveAssumptionsList(
     }
   }
 
+  if (usesAssumedStandbyCrew) {
+    assumptions.push(
+      `MODELLING ASSUMPTION: Spare aircraft deployment assumes a standby crew at the spare's base (${config.assumedStandbyCrew.preDepartureBriefingMins}m pre-departure briefing, ${config.assumedStandbyCrew.maxDutyMins}m max duty) because flight_network.json has no reserve crew records.`
+    );
+  }
+
   return assumptions;
 }
 
@@ -137,7 +164,8 @@ function evaluateCursorNextLeg(
   cursor: AircraftCursor,
   closure: AirportClosureEvent | null,
   config: SimulationConfig,
-  preCancelledFlightIds: ReadonlySet<string>
+  preCancelledFlightIds: ReadonlySet<string>,
+  flightMinDepartureByFlightId: Record<string, { minDepMin: number; reason: string; sourceRefId: string }>
 ): TentativeLegPlan {
   const leg = cursor.legs[cursor.nextIdx];
   const previousFlightId = cursor.nextIdx > 0 ? cursor.legs[cursor.nextIdx - 1].flightId : null;
@@ -148,10 +176,15 @@ function evaluateCursorNextLeg(
   let incomingUpstreamDelayMin = 0;
   let turnaroundSlackAvailableMin = 0;
   let turnaroundSlackAbsorbedMin = 0;
-  let readyDepMin = leg.scheduledDepMin;
+  let readyDepMin = Math.max(leg.scheduledDepMin, cursor.availableFromMin);
   let residualUpstreamDelayMin = 0;
 
-  if (!isPreCancelled && !isPhysicallyStranded && cursor.lastOperatedActualArrMin !== null && cursor.lastOperatedSchedArrMin !== null) {
+  if (
+    !isPreCancelled &&
+    !isPhysicallyStranded &&
+    cursor.lastOperatedActualArrMin !== null &&
+    cursor.lastOperatedSchedArrMin !== null
+  ) {
     const scheduledTurnaround = leg.scheduledDepMin - cursor.lastOperatedSchedArrMin;
     turnaroundSlackAvailableMin = Math.max(0, scheduledTurnaround - config.minTurnaroundMinutes);
     incomingUpstreamDelayMin = Math.max(
@@ -161,9 +194,20 @@ function evaluateCursorNextLeg(
     turnaroundSlackAbsorbedMin = Math.min(incomingUpstreamDelayMin, turnaroundSlackAvailableMin);
     readyDepMin = Math.max(
       leg.scheduledDepMin,
+      cursor.availableFromMin,
       cursor.lastOperatedActualArrMin + config.minTurnaroundMinutes
     );
     residualUpstreamDelayMin = Math.max(0, readyDepMin - leg.scheduledDepMin);
+  }
+
+  // Optional controlled departure hold (e.g., to protect a passenger connection)
+  let controlledHoldAddedMin = 0;
+  const controlledHoldInfo = flightMinDepartureByFlightId[leg.flightId] ?? null;
+  if (!isPreCancelled && !isPhysicallyStranded && controlledHoldInfo) {
+    if (controlledHoldInfo.minDepMin > readyDepMin) {
+      controlledHoldAddedMin = controlledHoldInfo.minDepMin - readyDepMin;
+      readyDepMin = controlledHoldInfo.minDepMin;
+    }
   }
 
   const closureEval = evaluateFlightAgainstClosure({
@@ -213,6 +257,8 @@ function evaluateCursorNextLeg(
     turnaroundSlackAbsorbedMin,
     readyDepMin,
     residualUpstreamDelayMin,
+    controlledHoldAddedMin,
+    controlledHoldInfo,
     closureEval,
     touchesReopenedOrigin,
     touchesReopenedDest,
@@ -229,19 +275,16 @@ function compareTentativePlans(
   closure: AirportClosureEvent | null,
   config: SimulationConfig
 ): number {
-  // 1. Immediately drain cancelled/stranded legs so aircraft positions stay settled
   const aCancelled = a.isPreCancelled || a.isPhysicallyStranded ? 0 : 1;
   const bCancelled = b.isPreCancelled || b.isPhysicallyStranded ? 0 : 1;
   if (aCancelled !== bCancelled) return aCancelled - bCancelled;
 
-  // 2. Always settle legs completing at or before closure reopening before allocating reopening slots
   if (closure) {
     const aPreReopen = !a.isCompetingAtReopenedAirport && a.closureEval.adjustedArrMin <= closure.endMin ? 0 : 1;
     const bPreReopen = !b.isCompetingAtReopenedAirport && b.closureEval.adjustedArrMin <= closure.endMin ? 0 : 1;
     if (aPreReopen !== bPreReopen) return aPreReopen - bPreReopen;
   }
 
-  // 3. Reopening queue ordering when both compete for reopened runway slots
   if (
     a.isCompetingAtReopenedAirport &&
     b.isCompetingAtReopenedAirport &&
@@ -258,7 +301,6 @@ function compareTentativePlans(
     return a.leg.flightId.localeCompare(b.leg.flightId);
   }
 
-  // 4. Strict chronological causality by ready/movement event time
   if (a.eventTimeMin !== b.eventTimeMin) {
     return a.eventTimeMin - b.eventTimeMin;
   }
@@ -280,24 +322,39 @@ export function simulateDisruption(
 ): SimulationResult {
   const config = resolveSimulationConfig(network, configOverrides);
   const preCancelledFlightIds = options?.preCancelledFlightIds ?? new Set<string>();
+  const flightMinDepartureByFlightId = options?.flightMinDepartureByFlightId ?? {};
   const appliedRecoveryActions = options?.appliedRecoveryActions ?? [];
 
-  // Initialize one deterministic cursor per active aircraft tail
-  const cursors: AircraftCursor[] = network.activeAircraft.map((ac) => {
-    const legs = network.index.flightsByTailId[ac.tailId];
-    return {
-      tailId: ac.tailId,
-      legs,
-      nextIdx: 0,
-      currentPosition: legs[0].origin,
-      lastOperatedFlightId: null,
-      lastOperatedSchedArrMin: null,
-      lastOperatedActualArrMin: null,
-      lastOperatedDominoDepth: -1,
-    };
-  });
+  // Initialize one deterministic cursor per operating aircraft tail
+  const cursors: AircraftCursor[] = options?.customRotations
+    ? options.customRotations.map((plan) => ({
+        tailId: plan.tailId,
+        isSpare: plan.isSpare,
+        availableFromMin: plan.availableFromMin,
+        legs: plan.legs,
+        nextIdx: 0,
+        currentPosition: plan.startingAirportId,
+        lastOperatedFlightId: null,
+        lastOperatedSchedArrMin: null,
+        lastOperatedActualArrMin: null,
+        lastOperatedDominoDepth: -1,
+      }))
+    : network.activeAircraft.map((ac) => {
+        const legs = network.index.flightsByTailId[ac.tailId];
+        return {
+          tailId: ac.tailId,
+          isSpare: false,
+          availableFromMin: 0,
+          legs,
+          nextIdx: 0,
+          currentPosition: legs[0].origin,
+          lastOperatedFlightId: null,
+          lastOperatedSchedArrMin: null,
+          lastOperatedActualArrMin: null,
+          lastOperatedDominoDepth: -1,
+        };
+      });
 
-  // Shared reopening runway capacity state for the closed airport
   const closedAirportCapacity = closure
     ? network.index.airportsById[closure.airportId].capacityPerHour
     : 0;
@@ -319,7 +376,6 @@ export function simulateDisruption(
 
     let slotMin = Math.max(readyTimeMin, closure.endMin);
 
-    // Rolling 60-minute capacity ceiling: at most `closedAirportCapacity` movements per 60m window
     if (reopenedMovementTimes.length >= closedAirportCapacity) {
       const blockingMovement =
         reopenedMovementTimes[reopenedMovementTimes.length - closedAirportCapacity];
@@ -329,7 +385,6 @@ export function simulateDisruption(
       }
     }
 
-    // Active reopening backlog spacing (never delays flights operating outside an active backlog wave)
     if (reopenedMovementTimes.length > 0) {
       const prevTime = reopenedMovementTimes[reopenedMovementTimes.length - 1];
       const inActiveBacklog = wasClosureHeld || readyTimeMin < backlogActiveUntilMin;
@@ -355,13 +410,18 @@ export function simulateDisruption(
     }
   };
 
-  // Chronological event loop across all aircraft rotations
   while (true) {
     const frontier: TentativeLegPlan[] = [];
     for (const cursor of cursors) {
       if (cursor.nextIdx < cursor.legs.length) {
         frontier.push(
-          evaluateCursorNextLeg(cursor, closure, config, preCancelledFlightIds)
+          evaluateCursorNextLeg(
+            cursor,
+            closure,
+            config,
+            preCancelledFlightIds,
+            flightMinDepartureByFlightId
+          )
         );
       }
     }
@@ -372,6 +432,7 @@ export function simulateDisruption(
     const { cursor, leg } = chosen;
     const posBefore = cursor.currentPosition;
     const crew = network.index.crewByTailId[cursor.tailId];
+    const effectiveLegOrder = cursor.nextIdx + 1;
 
     // Path A: Pre-cancelled or physically stranded by an earlier cancellation on this tail
     if (chosen.isPreCancelled || chosen.isPhysicallyStranded) {
@@ -422,7 +483,7 @@ export function simulateDisruption(
         flightId: leg.flightId,
         assignedTailId: cursor.tailId,
         originalTailId: leg.tailId,
-        legOrder: leg.legOrder,
+        legOrder: effectiveLegOrder,
         previousFlightId: chosen.previousFlightId,
         origin: leg.origin,
         destination: leg.destination,
@@ -479,11 +540,9 @@ export function simulateDisruption(
           actualDepMin = slotPreview.slotMin;
           actualArrMin = actualDepMin + leg.blockMinutes;
         } else if (chosen.closureEval.isAlreadyAirborne) {
-          // Already airborne before closure started -> extends airborne holding
           actualArrMin = slotPreview.slotMin;
           airborneHoldMinutes += reopeningSlotDelayMinutes;
         } else {
-          // Not yet departed -> hold at origin so arrival matches assigned runway slot
           actualDepMin += reopeningSlotDelayMinutes;
           actualArrMin = slotPreview.slotMin;
         }
@@ -493,7 +552,6 @@ export function simulateDisruption(
     const departureDelayMin = Math.max(0, actualDepMin - leg.scheduledDepMin);
     const arrivalDelayMin = Math.max(0, actualArrMin - leg.scheduledArrMin);
 
-    // Check optional strict crew cutoff or auto-cancel threshold (both OFF by default)
     const exceedsAutoCancel =
       config.autoCancelDelayThresholdMin !== null &&
       arrivalDelayMin > config.autoCancelDelayThresholdMin;
@@ -518,10 +576,9 @@ export function simulateDisruption(
             explanation: `Cancelled under auto-cancel threshold (${arrivalDelayMin}m > ${config.autoCancelDelayThresholdMin}m). Aircraft ${cursor.tailId} remains at ${posBefore}.`,
           };
 
-      const dominoDepth =
-        chosen.wasClosureHeld
-          ? 0
-          : Math.max(1, cursor.lastOperatedDominoDepth + 1);
+      const dominoDepth = chosen.wasClosureHeld
+        ? 0
+        : Math.max(1, cursor.lastOperatedDominoDepth + 1);
 
       const causalExplanation = buildFlightCausalExplanation({
         flight: leg,
@@ -545,7 +602,7 @@ export function simulateDisruption(
         flightId: leg.flightId,
         assignedTailId: cursor.tailId,
         originalTailId: leg.tailId,
-        legOrder: leg.legOrder,
+        legOrder: effectiveLegOrder,
         previousFlightId: chosen.previousFlightId,
         origin: leg.origin,
         destination: leg.destination,
@@ -578,18 +635,26 @@ export function simulateDisruption(
         dominoDepth,
       });
 
-      // Aircraft does NOT move and does NOT consume a runway slot
       cursor.nextIdx += 1;
       continue;
     }
 
-    // Commit reopening slot now that the leg is confirmed operated
     if (committedSlotTime !== null) {
       commitReopeningSlot(committedSlotTime, slotReadyRef, chosen.wasClosureHeld);
     }
 
-    // Assemble ordered deterministic causes for this operated leg
     const causes: DisruptionCause[] = [];
+
+    if (cursor.tailId !== leg.tailId) {
+      causes.push({
+        type: 'recovery_action_reassignment',
+        delayContributionMin: 0,
+        sourceRefId: cursor.tailId,
+        explanation: cursor.isSpare
+          ? `Reassigned from ${leg.tailId} to spare aircraft ${cursor.tailId}.`
+          : `Reassigned from ${leg.tailId} to swapped aircraft ${cursor.tailId}.`,
+      });
+    }
 
     if (chosen.residualUpstreamDelayMin > 0 && chosen.previousFlightId) {
       causes.push({
@@ -600,6 +665,15 @@ export function simulateDisruption(
           chosen.turnaroundSlackAbsorbedMin > 0
             ? `Previous leg ${chosen.previousFlightId} arrived ${chosen.incomingUpstreamDelayMin}m late; ${chosen.turnaroundSlackAbsorbedMin}m turnaround slack absorbed, leaving +${chosen.residualUpstreamDelayMin}m delay (${config.minTurnaroundMinutes}m min turnaround).`
             : `Previous leg ${chosen.previousFlightId} arrived ${chosen.incomingUpstreamDelayMin}m late with 0m turnaround slack (${config.minTurnaroundMinutes}m min turnaround), propagating +${chosen.residualUpstreamDelayMin}m.`,
+      });
+    }
+
+    if (chosen.controlledHoldAddedMin > 0 && chosen.controlledHoldInfo) {
+      causes.push({
+        type: 'recovery_action_hold',
+        delayContributionMin: chosen.controlledHoldAddedMin,
+        sourceRefId: chosen.controlledHoldInfo.sourceRefId,
+        explanation: chosen.controlledHoldInfo.reason,
       });
     }
 
@@ -643,7 +717,8 @@ export function simulateDisruption(
     const hasDirectHit =
       closureGroundHoldMinutes > 0 ||
       airborneHoldMinutes > 0 ||
-      reopeningSlotDelayMinutes > 0;
+      reopeningSlotDelayMinutes > 0 ||
+      chosen.controlledHoldAddedMin > 0;
     const hasPropagatedHit = chosen.residualUpstreamDelayMin > 0;
 
     let impactCategory: FlightImpactCategory = 'unaffected';
@@ -660,8 +735,6 @@ export function simulateDisruption(
       dominoDepth = 0;
     } else if (hasPropagatedHit) {
       dominoDepth = cursor.lastOperatedDominoDepth >= 0 ? cursor.lastOperatedDominoDepth + 1 : 1;
-    } else {
-      dominoDepth = 0;
     }
 
     const status = isDelayed ? 'delayed' : 'on_time';
@@ -675,7 +748,7 @@ export function simulateDisruption(
       turnaroundSlackAvailableMin: chosen.turnaroundSlackAvailableMin,
       turnaroundSlackAbsorbedMin: chosen.turnaroundSlackAbsorbedMin,
       residualUpstreamDelayMin: chosen.residualUpstreamDelayMin,
-      closureGroundHoldMinutes,
+      closureGroundHoldMinutes: closureGroundHoldMinutes + chosen.controlledHoldAddedMin,
       airborneHoldMinutes,
       reopeningSlotDelayMinutes,
       finalArrivalDelayMin: arrivalDelayMin,
@@ -688,7 +761,7 @@ export function simulateDisruption(
       flightId: leg.flightId,
       assignedTailId: cursor.tailId,
       originalTailId: leg.tailId,
-      legOrder: leg.legOrder,
+      legOrder: effectiveLegOrder,
       previousFlightId: chosen.previousFlightId,
       origin: leg.origin,
       destination: leg.destination,
@@ -723,7 +796,6 @@ export function simulateDisruption(
       });
     }
 
-    // Advance physical aircraft state
     cursor.currentPosition = leg.destination;
     cursor.lastOperatedFlightId = leg.flightId;
     cursor.lastOperatedSchedArrMin = leg.scheduledArrMin;
@@ -732,7 +804,6 @@ export function simulateDisruption(
     cursor.nextIdx += 1;
   }
 
-  // Canonical dataset order for deterministic results
   const simulatedFlights: SimulatedFlightState[] = network.flights.map((f) => {
     const state = simulatedByFlightId.get(f.flightId);
     if (!state) {
@@ -741,8 +812,7 @@ export function simulateDisruption(
     return state;
   });
 
-  // Crew duty compliance analysis (using ACTUAL flight completion times)
-  const crews: SimulatedCrewState[] = analyzeCrewDuty(network, simulatedFlights);
+  const crews: SimulatedCrewState[] = analyzeCrewDuty(network, simulatedFlights, config);
   const violatingFlightSet = new Set<string>(crews.flatMap((c) => c.violatingFlightIds));
   for (const sf of simulatedFlights) {
     if (violatingFlightSet.has(sf.flightId)) {
@@ -750,7 +820,6 @@ export function simulateDisruption(
     }
   }
 
-  // Aircraft rotation summaries & physical continuity invariant guard
   const rotations = buildRotationSummaries(
     network,
     simulatedFlights,
@@ -763,13 +832,11 @@ export function simulateDisruption(
     );
   }
 
-  // Passenger connection & non-double-counted impact analysis
   const { connections, summary: passengerImpact } = analyzePassengerImpact(
     network,
     simulatedFlights
   );
 
-  // Derive every summary KPI strictly from individual flight, passenger, rotation & crew results
   const operatedFlightsList = simulatedFlights.filter((f) => f.status !== 'cancelled');
   const delayedFlightsList = simulatedFlights.filter((f) => f.status === 'delayed');
   const onTimeFlights = simulatedFlights.filter((f) => f.status === 'on_time').length;
@@ -822,6 +889,7 @@ export function simulateDisruption(
     return a.flightId.localeCompare(b.flightId);
   });
 
+  const usesAssumedStandbyCrew = crews.some((c) => c.isAssumedStandbyCrew);
   const scenarioId =
     options?.scenarioId ??
     (closure ? `SIM-${closure.id}` : 'SIM-BASELINE-NO-CLOSURE');
@@ -831,7 +899,7 @@ export function simulateDisruption(
     closure,
     config,
     appliedRecoveryActions,
-    activeAssumptions: buildActiveAssumptionsList(closure, config),
+    activeAssumptions: buildActiveAssumptionsList(closure, config, usesAssumedStandbyCrew),
     flights: simulatedFlights,
     rotations,
     connections,
@@ -842,10 +910,6 @@ export function simulateDisruption(
   };
 }
 
-/**
- * Traces the full backward rotation dependency chain from a target flight back to
- * the root leg on the same aircraft that initiated its disruption.
- */
 export function traceCausalChain(
   flights: SimulatedFlightState[],
   flightId: string

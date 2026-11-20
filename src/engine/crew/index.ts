@@ -17,12 +17,15 @@ import type {
   NormalizedFlightNetwork,
   SimulatedCrewState,
   SimulatedFlightState,
+  SimulationConfig,
 } from '../../types/index.ts';
+import { formatMinutesToClock } from '../time.ts';
 
 export interface CrewDutyAnalyzer {
   analyzeCrewDuty(
     network: NormalizedFlightNetwork,
-    simulatedFlights: SimulatedFlightState[]
+    simulatedFlights: SimulatedFlightState[],
+    config?: SimulationConfig
   ): SimulatedCrewState[];
 }
 
@@ -96,35 +99,37 @@ export function evaluateCrewDutyCompliance(params: {
 }
 
 /**
- * Evaluates all 16 official crew rosters against actual simulated flight completion times.
+ * Evaluates all 16 official crew rosters against actual simulated flight completion times
+ * (including any swapped leg assignments), PLUS explicitly disclosed assumed standby crews
+ * whenever a spare aircraft (VT-DS17 / VT-DS18) is deployed in recovery.
  */
 export function analyzeCrewDuty(
   network: NormalizedFlightNetwork,
-  simulatedFlights: SimulatedFlightState[]
+  simulatedFlights: SimulatedFlightState[],
+  config?: SimulationConfig
 ): SimulatedCrewState[] {
-  const flightMap = new Map<string, SimulatedFlightState>();
+  const flightsByAssignedTail = new Map<string, SimulatedFlightState[]>();
   for (const sf of simulatedFlights) {
-    flightMap.set(sf.flightId, sf);
+    const list = flightsByAssignedTail.get(sf.assignedTailId) ?? [];
+    list.push(sf);
+    flightsByAssignedTail.set(sf.assignedTailId, list);
   }
 
-  return network.crews.map((crew) => {
-    // Only evaluate legs still operated by this crew's assigned tail (supports future spare/swap reassignments)
-    const legCompletions: LegActualCompletion[] = crew.flightIds
-      .map((flightId) => {
-        const sf = flightMap.get(flightId);
-        if (!sf) {
-          return { flightId, actualArrMin: null };
-        }
-        // If flight was reassigned away from this crew's tail, crew no longer flies it
-        if (sf.assignedTailId !== crew.tailId) {
-          return null;
-        }
-        return {
-          flightId,
-          actualArrMin: sf.status === 'cancelled' ? null : sf.actualArrMin,
-        };
-      })
-      .filter((item): item is LegActualCompletion => item !== null);
+  for (const list of flightsByAssignedTail.values()) {
+    list.sort((a, b) => {
+      if (a.scheduledDepMin !== b.scheduledDepMin) {
+        return a.scheduledDepMin - b.scheduledDepMin;
+      }
+      return a.legOrder - b.legOrder;
+    });
+  }
+
+  const results: SimulatedCrewState[] = network.crews.map((crew) => {
+    const assignedFlights = flightsByAssignedTail.get(crew.tailId) ?? [];
+    const legCompletions: LegActualCompletion[] = assignedFlights.map((sf) => ({
+      flightId: sf.flightId,
+      actualArrMin: sf.status === 'cancelled' ? null : sf.actualArrMin,
+    }));
 
     return evaluateCrewDutyCompliance({
       crew,
@@ -132,4 +137,49 @@ export function analyzeCrewDuty(
       isAssumedStandbyCrew: false,
     });
   });
+
+  // Evaluate any deployed spare aircraft using the explicit configurable standby-crew modelling assumption
+  for (const spare of network.spareAircraft) {
+    const spareFlights = flightsByAssignedTail.get(spare.tailId);
+    if (!spareFlights || spareFlights.length === 0) continue;
+
+    const operatedSpareFlights = spareFlights.filter(
+      (sf) => sf.status !== 'cancelled' && sf.actualDepMin !== null && sf.actualArrMin !== null
+    );
+    const firstDepMin =
+      operatedSpareFlights.length > 0
+        ? operatedSpareFlights[0].actualDepMin!
+        : spareFlights[0].scheduledDepMin;
+    const briefingMins = config?.assumedStandbyCrew.preDepartureBriefingMins ?? 45;
+    const maxDutyMins = config?.assumedStandbyCrew.maxDutyMins ?? 600;
+    const dutyStartMin = Math.max(0, firstDepMin - briefingMins);
+    const lastSchedArrMin = spareFlights[spareFlights.length - 1].scheduledArrMin;
+    const scheduledDutyMins = Math.max(0, lastSchedArrMin - dutyStartMin);
+
+    const syntheticCrew: CrewRecord = {
+      crewId: `ASSUMED-STBY-${spare.tailId}`,
+      tailId: spare.tailId,
+      baseAirportId: spare.baseAirportId,
+      dutyStartStr: formatMinutesToClock(dutyStartMin),
+      dutyStartMin,
+      maxDutyMins,
+      flightIds: spareFlights.map((sf) => sf.flightId),
+      scheduledDutyMins,
+      scheduledDutyMarginMins: maxDutyMins - scheduledDutyMins,
+    };
+
+    results.push(
+      evaluateCrewDutyCompliance({
+        crew: syntheticCrew,
+        legCompletions: spareFlights.map((sf) => ({
+          flightId: sf.flightId,
+          actualArrMin: sf.status === 'cancelled' ? null : sf.actualArrMin,
+        })),
+        isAssumedStandbyCrew: true,
+        assumptionDisclosure: `MODELLING ASSUMPTION (not in official JSON): Assumes standby crew at ${spare.baseAirportId} reporting ${briefingMins}m prior (${formatMinutesToClock(dutyStartMin)}) with ${maxDutyMins}m max duty.`,
+      })
+    );
+  }
+
+  return results;
 }
