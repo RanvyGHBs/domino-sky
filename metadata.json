@@ -1,0 +1,8 @@
+{
+  "name": "Domino Sky",
+  "description": "Interactive airline disruption and recovery simulator with deterministic delay propagation, aircraft rotation tracking, passenger connection analysis, crew duty-time compliance, and Gemini AI dispatcher guidance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
