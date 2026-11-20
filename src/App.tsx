@@ -9,6 +9,7 @@ import { ValidationSection } from './components/ValidationSection.tsx';
 import { RulesSection } from './components/RulesSection.tsx';
 import { ArchitectureSection } from './components/ArchitectureSection.tsx';
 import { SimulationTestSection } from './components/SimulationTestSection.tsx';
+import { DispatcherTestSection } from './components/DispatcherTestSection.tsx';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<FoundationTab>('dataset');
@@ -99,6 +100,9 @@ export default function App() {
             )}
             {activeTab === 'simulation' && (
               <SimulationTestSection network={bundle.network} />
+            )}
+            {activeTab === 'dispatcher' && (
+              <DispatcherTestSection network={bundle.network} />
             )}
           </>
         )}

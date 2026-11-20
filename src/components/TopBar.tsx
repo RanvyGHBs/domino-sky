@@ -1,6 +1,12 @@
 import { RefreshCw } from 'lucide-react';
 
-export type FoundationTab = 'dataset' | 'validation' | 'rules' | 'architecture' | 'simulation';
+export type FoundationTab =
+  | 'dataset'
+  | 'validation'
+  | 'rules'
+  | 'architecture'
+  | 'simulation'
+  | 'dispatcher';
 
 interface TopBarProps {
   activeTab: FoundationTab;
@@ -15,6 +21,7 @@ const NAV_ITEMS: Array<{ id: FoundationTab; label: string }> = [
   { id: 'rules', label: 'Rules' },
   { id: 'architecture', label: 'Architecture' },
   { id: 'simulation', label: 'Simulation Test' },
+  { id: 'dispatcher', label: 'AI Dispatcher' },
 ];
 
 export function TopBar({ activeTab, onSelectTab, onReload, isLoading }: TopBarProps) {

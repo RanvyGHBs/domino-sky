@@ -51,6 +51,26 @@ import {
   parseHHMMToMinutes,
 } from '../src/engine/time.ts';
 import { OFFICIAL_AND_ASSUMED_RULES } from '../src/engine/assumptions.ts';
+import {
+  DispatcherInputValidationError,
+  buildDispatcherUserPrompt,
+  runDispatcherRecommendation,
+  validateDispatcherRequest,
+  type GeminiInvoker,
+} from '../src/server/dispatcher/index.ts';
+import {
+  DispatcherGeminiError,
+  classifyGeminiError,
+  executeWithBounded503Retry,
+  sanitizeErrorMessage,
+} from '../src/server/dispatcher/geminiClient.ts';
+import {
+  MAX_PROMPT_FEASIBLE_CANDIDATES,
+  MAX_PROMPT_REJECTED_CANDIDATES,
+  buildSimulationSummary,
+  selectPromptFeasibleCandidates,
+  selectPromptRejectedCandidates,
+} from '../src/server/dispatcher/prompt.ts';
 
 const DATASET_PATH = path.resolve(
   process.cwd(),
@@ -68,6 +88,18 @@ const outcomes: TestOutcome[] = [];
 function runTest(name: string, fn: () => string) {
   try {
     const detail = fn();
+    outcomes.push({ name, passed: true, detail });
+    console.log(`PASS  ${name} — ${detail}`);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    outcomes.push({ name, passed: false, detail });
+    console.error(`FAIL  ${name} — ${detail}`);
+  }
+}
+
+async function runAsyncTest(name: string, fn: () => Promise<string>) {
+  try {
+    const detail = await fn();
     outcomes.push({ name, passed: true, detail });
     console.log(`PASS  ${name} — ${detail}`);
   } catch (err) {
@@ -737,8 +769,821 @@ runTest('27. Recovery: Physically impossible actions are strictly rejected befor
   return 'executeRecoveryAction rejected physically impossible spare teleportation cleanly';
 });
 
-const failed = outcomes.filter((o) => !o.passed);
-console.log(`\nSummary: ${outcomes.length - failed.length}/${outcomes.length} foundation, simulation & recovery checks passed.`);
-if (failed.length > 0) {
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// Module 09: AI Dispatcher Integration, Validation & Deterministic Fallback Tests
+// ---------------------------------------------------------------------------
+
+async function runDispatcherVerificationTests() {
+  await runAsyncTest(
+    '28. Dispatcher API validation: rejects invalid airport, duration, preference, and missing required fields',
+    async () => {
+      assert.throws(
+        () => validateDispatcherRequest(network, { airportId: 'ZZZ', startTime: '08:00', durationMinutes: 120 }),
+        DispatcherInputValidationError
+      );
+      assert.throws(
+        () => validateDispatcherRequest(network, { airportId: 'BOM', startTime: '08:00', durationMinutes: -30 }),
+        DispatcherInputValidationError
+      );
+      assert.throws(
+        () => validateDispatcherRequest(network, { airportId: 'BOM', startTime: '08:00', durationMinutes: 120, preference: 'maximize_profit' }),
+        DispatcherInputValidationError
+      );
+      assert.throws(
+        () => validateDispatcherRequest(network, { airportId: 'BOM', durationMinutes: 120 }),
+        DispatcherInputValidationError
+      );
+      assert.throws(
+        () => validateDispatcherRequest(network, { startTime: '08:00', durationMinutes: 120 }),
+        DispatcherInputValidationError
+      );
+      assert.throws(
+        () => validateDispatcherRequest(network, { airportId: 'BOM', startTime: '08:00' }),
+        DispatcherInputValidationError
+      );
+      return 'Rejected invalid airport, negative duration, unknown preference, and missing fields cleanly';
+    }
+  );
+
+  await runAsyncTest(
+    '29. Dispatcher AI Integration: successful Gemini response hydrated with exact deterministic KPIs & preference',
+    async () => {
+      let capturedPrompt = '';
+      const mockInvoker: GeminiInvoker = async (params) => {
+        capturedPrompt = params.userPrompt;
+        return JSON.stringify({
+          situationOverview:
+            'BOM is closed 08:00-10:00 IST for 120 minutes, impacting 17 delayed flights (897 minutes total delay) and 3 missed connections affecting 92 passengers.',
+          recommendedActions: [
+            {
+              actionId: 'REC-SPARE-VT-DS17-DS0502',
+              title: 'Deploy spare VT-DS17 from BLR on DS0502 rotation',
+              reason: 'Eliminates 131 minutes of delay and saves 44 connecting passengers on CX09 with zero cancellations.',
+              benefits: ['Saves 44 stranded passengers on CX09', 'Reduces total delay by 131 minutes'],
+              tradeoffs: ['Assumes standby crew at BLR (45 minutes pre-departure briefing)'],
+              operationalImpact: {
+                flightsAffected: ['DS0502', 'DS0503', 'DS0504'],
+                passengerImpact: 'Reduces total stranded passengers from 92 to 48 by saving CX09 (44 passengers).',
+                crewImpact: 'No crew duty violations; relies on configured standby crew assumption at BLR.',
+                aircraftImpact: 'VT-DS17 operates DS0502, DS0503, and DS0504 while preserving rotation continuity.',
+              },
+            },
+            {
+              actionId: 'REC-HOLD-CX09-DS1305',
+              title: 'Controlled hold on DS1305 to protect CX09',
+              reason: 'Protects 44 connecting passengers on CX09 without deploying a spare aircraft.',
+              benefits: ['Saves 44 connecting passengers on CX09'],
+              tradeoffs: ['Adds 27 minutes of network delay to DS1305'],
+              operationalImpact: {
+                flightsAffected: ['DS1305'],
+                passengerImpact: 'Reduces stranded passengers from 92 to 48.',
+                crewImpact: 'Zero crew duty violations.',
+                aircraftImpact: 'Adds 27 minutes delay on VT-DS13 final leg DS1305.',
+              },
+            },
+          ],
+          alternativeActions: [
+            {
+              actionId: 'REC-SPARE-VT-DS18-DS1503',
+              reasonLessSuitable: 'Reduces delay by 41 minutes but saves 0 stranded passengers.',
+              keyTradeoff: 'Uses spare VT-DS18 from DEL without resolving missed connections.',
+            },
+          ],
+          rejectedActionExplanations: [
+            {
+              actionId: 'REC-SWAP-VT-DS02-DS0202-VT-DS15-DS1502',
+              reason: 'Rejected because swapping tails causes crew duty limit violations.',
+            },
+          ],
+          dispatcherSummary:
+            'Deploying VT-DS17 on DS0502 is the strongest option for minimising passenger impact, reducing stranded passengers by 44 and cutting total delay by 131 minutes.',
+          assumptions: ['Spare VT-DS17 relies on the 45-minute standby crew modelling assumption.'],
+        });
+      };
+
+      const res = await runDispatcherRecommendation(
+        network,
+        {
+          airportId: 'BOM',
+          startTime: '08:00',
+          durationMinutes: 120,
+          preference: 'minimise_passenger_impact',
+        },
+        { apiKey: 'test-mock-key', invoker: mockInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'success');
+      assert.equal(res.source, 'gemini');
+      assert.equal(res.preference, 'minimise_passenger_impact');
+      assert.ok(capturedPrompt.includes('minimise_passenger_impact'), 'Preference must be sent to Gemini');
+      assert.equal(res.recommendedActions.length, 2);
+      assert.ok(res.recommendedActions.length <= 3);
+
+      // Verify backend-authoritative KPI hydration matches deterministic engine bit-for-bit
+      const directClosure = createAirportClosureEvent(network, 'BOM', parseHHMMToMinutes('08:00'), 120);
+      const directBase = simulateDisruption(network, directClosure);
+      const directRanked = generateAndRankRecoveryOptions(network, directBase);
+      const expectedTop = directRanked.rankedOptions.find(
+        (o) => o.action.actionId === 'REC-SPARE-VT-DS17-DS0502'
+      )!;
+
+      assert.deepEqual(res.recommendedActions[0].verifiedKpiComparison.before, expectedTop.comparison.baseline.kpis);
+      assert.deepEqual(res.recommendedActions[0].verifiedKpiComparison.after, expectedTop.comparison.recovered.kpis);
+      assert.deepEqual(res.recommendedActions[0].verifiedKpiComparison.deltas, expectedTop.comparison.deltas);
+      assert.equal(res.recommendedActions[0].usesAssumedStandbyCrew, true);
+      assert.equal(res.deterministicRankings.length, directRanked.rankedOptions.length);
+      return `Gemini success hydrated 2 recommendations with exact backend KPIs (-131m, -44 pax) & preference passed`;
+    }
+  );
+
+  await runAsyncTest(
+    '30. Dispatcher fallback: missing API key returns clearly labelled unavailable deterministic fallback',
+    async () => {
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120, preference: 'balanced' },
+        { apiKey: '' }
+      );
+
+      assert.equal(res.aiStatus, 'unavailable');
+      assert.equal(res.source, 'deterministic_fallback');
+      assert.equal(res.fallbackReason, 'missing_api_key');
+      assert.equal(res.recommendedActions.length, 3);
+      assert.equal(res.recommendedActions[0].actionId, res.deterministicRankings[0].actionId);
+      assert.equal(res.simulationSummary.kpis.totalDelayMinutes, 897);
+      return `Missing key returned aiStatus=unavailable with deterministic #1=${res.recommendedActions[0].actionId}`;
+    }
+  );
+
+  await runAsyncTest(
+    '31. Dispatcher fallback: Gemini timeout activates deterministic fallback cleanly',
+    async () => {
+      const timeoutInvoker: GeminiInvoker = async () => {
+        throw new DispatcherGeminiError('timeout', 'Gemini request timed out after 50ms.');
+      };
+
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: timeoutInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.equal(res.source, 'deterministic_fallback');
+      assert.equal(res.fallbackReason, 'timeout');
+      assert.equal(res.recommendedActions[0].actionId, 'REC-SPARE-VT-DS17-DS0502');
+      assert.equal(res.simulationSummary.kpis.totalDelayMinutes, 897);
+      return 'Timeout triggered aiStatus=fallback while preserving deterministic baseline & rankings';
+    }
+  );
+
+  await runAsyncTest(
+    '32. Dispatcher fallback: Gemini rate-limit (429 RESOURCE_EXHAUSTED) activates deterministic fallback',
+    async () => {
+      const rateLimitInvoker: GeminiInvoker = async () => {
+        throw new Error('429 RESOURCE_EXHAUSTED: Quota exceeded for model');
+      };
+
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: rateLimitInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.equal(res.source, 'deterministic_fallback');
+      assert.equal(res.fallbackReason, 'rate_limit');
+      assert.equal(res.recommendedActions.length, 3);
+      return 'Rate-limit error classified as rate_limit and handled via deterministic fallback';
+    }
+  );
+
+  await runAsyncTest(
+    '33. Dispatcher validation: malformed JSON from Gemini is rejected and falls back cleanly',
+    async () => {
+      const badJsonInvoker: GeminiInvoker = async () => '{ "situationOverview": "broken json...';
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: badJsonInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.equal(res.fallbackReason, 'validation_failed');
+      assert.ok(res.validationIssues?.some((i) => i.code === 'MALFORMED_JSON'));
+      assert.equal(res.recommendedActions[0].actionId, 'REC-SPARE-VT-DS17-DS0502');
+      return 'Caught MALFORMED_JSON and switched to deterministic fallback';
+    }
+  );
+
+  await runAsyncTest(
+    '34. Dispatcher validation: unknown actionId from Gemini is strictly rejected',
+    async () => {
+      const unknownActionInvoker: GeminiInvoker = async () =>
+        JSON.stringify({
+          situationOverview: 'BOM closed for 120 minutes.',
+          recommendedActions: [
+            {
+              actionId: 'REC-INVENTED-999',
+              title: 'Invented Action',
+              reason: 'Hallucinated option.',
+              benefits: ['None'],
+              tradeoffs: ['Invalid'],
+              operationalImpact: {
+                flightsAffected: ['DS0502'],
+                passengerImpact: 'None',
+                crewImpact: 'None',
+                aircraftImpact: 'None',
+              },
+            },
+          ],
+          alternativeActions: [],
+          rejectedActionExplanations: [],
+          dispatcherSummary: 'Summary.',
+          assumptions: [],
+        });
+
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: unknownActionInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.ok(res.validationIssues?.some((i) => i.code === 'UNKNOWN_ACTION_ID'));
+      assert.ok(!res.recommendedActions.some((r) => r.actionId === 'REC-INVENTED-999'));
+      return 'Rejected hallucinated actionId REC-INVENTED-999 and activated fallback';
+    }
+  );
+
+  await runAsyncTest(
+    '35. Dispatcher validation: infeasible/rejected actionId recommended by Gemini is strictly rejected',
+    async () => {
+      const infeasibleInvoker: GeminiInvoker = async () =>
+        JSON.stringify({
+          situationOverview: 'BOM closed for 120 minutes.',
+          recommendedActions: [
+            {
+              actionId: 'REC-SWAP-VT-DS02-DS0202-VT-DS15-DS1502',
+              title: 'Infeasible Swap',
+              reason: 'Attempts to recommend a crew-violating swap.',
+              benefits: ['None'],
+              tradeoffs: ['Violates crew duty'],
+              operationalImpact: {
+                flightsAffected: ['DS0202', 'DS1502'],
+                passengerImpact: 'None',
+                crewImpact: 'Violates crew duty.',
+                aircraftImpact: 'Invalid swap.',
+              },
+            },
+          ],
+          alternativeActions: [],
+          rejectedActionExplanations: [],
+          dispatcherSummary: 'Summary.',
+          assumptions: [],
+        });
+
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: infeasibleInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.ok(res.validationIssues?.some((i) => i.code === 'INFEASIBLE_ACTION_ID'));
+      assert.ok(
+        !res.recommendedActions.some((r) => r.actionId === 'REC-SWAP-VT-DS02-DS0202-VT-DS15-DS1502')
+      );
+      return 'Rejected infeasible swap recommendation (INFEASIBLE_ACTION_ID) and activated fallback';
+    }
+  );
+
+  await runAsyncTest(
+    '36. Dispatcher validation: unsupported flight ID in Gemini output is strictly rejected',
+    async () => {
+      const badFlightInvoker: GeminiInvoker = async () =>
+        JSON.stringify({
+          situationOverview: 'BOM closed for 120 minutes.',
+          recommendedActions: [
+            {
+              actionId: 'REC-SPARE-VT-DS17-DS0502',
+              title: 'Deploy VT-DS17',
+              reason: 'Valid action with fabricated flight ID.',
+              benefits: ['Reduces total delay by 131 minutes'],
+              tradeoffs: ['Uses standby crew'],
+              operationalImpact: {
+                flightsAffected: ['DS0502', 'DS9999'],
+                passengerImpact: 'Saves 44 passengers.',
+                crewImpact: 'Standby crew used.',
+                aircraftImpact: 'VT-DS17 deployed.',
+              },
+            },
+          ],
+          alternativeActions: [],
+          rejectedActionExplanations: [],
+          dispatcherSummary: 'Summary.',
+          assumptions: [],
+        });
+
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: badFlightInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.ok(res.validationIssues?.some((i) => i.code === 'UNSUPPORTED_FLIGHT_ID'));
+      return 'Rejected fabricated flight ID DS9999 (UNSUPPORTED_FLIGHT_ID) and activated fallback';
+    }
+  );
+
+  await runAsyncTest(
+    '37. Dispatcher validation: unsupported numerical KPI claims in Gemini prose are detected & rejected',
+    async () => {
+      const badNumbersInvoker: GeminiInvoker = async () =>
+        JSON.stringify({
+          situationOverview: 'BOM closed for 120 minutes causing 897 minutes of delay.',
+          recommendedActions: [
+            {
+              actionId: 'REC-SPARE-VT-DS17-DS0502',
+              title: 'Deploy VT-DS17',
+              reason: 'Hallucinated claim: saves 999 minutes of delay and protects 777 stranded passengers.',
+              benefits: ['Saves 999 minutes of delay'],
+              tradeoffs: ['Uses standby crew'],
+              operationalImpact: {
+                flightsAffected: ['DS0502', 'DS0503', 'DS0504'],
+                passengerImpact: 'Saves 777 stranded passengers.',
+                crewImpact: 'Zero crew violations.',
+                aircraftImpact: 'VT-DS17 deployed.',
+              },
+            },
+          ],
+          alternativeActions: [],
+          rejectedActionExplanations: [],
+          dispatcherSummary: 'Summary.',
+          assumptions: [],
+        });
+
+      const res = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: badNumbersInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'fallback');
+      assert.ok(res.validationIssues?.some((i) => i.code === 'UNSUPPORTED_NUMERICAL_CLAIM'));
+      return 'Caught fabricated KPI claims (999m delay, 777 pax) via UNSUPPORTED_NUMERICAL_CLAIM';
+    }
+  );
+
+  await runAsyncTest(
+    '38. Dispatcher edge case: empty feasible candidate list returns 0 recommendations & rejects fabricated actions',
+    async () => {
+      // Closure at TRV 00:15 for 30 minutes affects 0 flights -> 0 feasible candidates
+      const emptyFallbackRes = await runDispatcherRecommendation(
+        network,
+        { airportId: 'TRV', startTime: '00:15', durationMinutes: 30 },
+        { apiKey: '' }
+      );
+      assert.equal(emptyFallbackRes.feasibleCandidates.length, 0);
+      assert.equal(emptyFallbackRes.recommendedActions.length, 0);
+      assert.ok(emptyFallbackRes.dispatcherSummary.toLowerCase().includes('reassessment'));
+
+      // Even if Gemini tries to fabricate a recommendation on an empty candidate list, reject it
+      const fabricateOnEmptyInvoker: GeminiInvoker = async () =>
+        JSON.stringify({
+          situationOverview: 'TRV closed for 30 minutes with 0 delayed flights.',
+          recommendedActions: [
+            {
+              actionId: 'REC-SPARE-VT-DS17-DS0502',
+              title: 'Unneeded spare',
+              reason: 'Fabricated.',
+              benefits: [],
+              tradeoffs: [],
+              operationalImpact: {
+                flightsAffected: ['DS0502'],
+                passengerImpact: 'None',
+                crewImpact: 'None',
+                aircraftImpact: 'None',
+              },
+            },
+          ],
+          alternativeActions: [],
+          rejectedActionExplanations: [],
+          dispatcherSummary: 'None.',
+          assumptions: [],
+        });
+
+      const guardedRes = await runDispatcherRecommendation(
+        network,
+        { airportId: 'TRV', startTime: '00:15', durationMinutes: 30 },
+        { apiKey: 'test-mock-key', invoker: fabricateOnEmptyInvoker }
+      );
+      assert.equal(guardedRes.aiStatus, 'fallback');
+      assert.equal(guardedRes.recommendedActions.length, 0);
+      return 'Empty candidate scenario returned 0 recommendations and blocked hallucinated actions';
+    }
+  );
+
+  await runAsyncTest(
+    '39. Dispatcher determinism & regression: repeated calls preserve identical deterministic baseline & rankings',
+    async () => {
+      const req = {
+        airportId: 'DEL',
+        startTime: '12:00',
+        durationMinutes: 150,
+        preference: 'protect_crew_compliance',
+      };
+      const run1 = await runDispatcherRecommendation(network, req, { apiKey: '' });
+      const run2 = await runDispatcherRecommendation(network, req, { apiKey: '' });
+
+      assert.deepEqual(run1.simulationSummary, run2.simulationSummary);
+      assert.deepEqual(run1.deterministicRankings, run2.deterministicRankings);
+      assert.deepEqual(run1.recommendedActions, run2.recommendedActions);
+      assert.equal(run1.simulationSummary.kpis.crewViolationsCount, 3);
+      return `Repeated DEL 12:00 calls produced bit-identical deterministic rankings (${run1.deterministicRankings.length} options)`;
+    }
+  );
+
+  await runAsyncTest(
+    '40. Dispatcher reliability: granular Gemini error classifications & secret sanitization',
+    async () => {
+      assert.equal(
+        classifyGeminiError(
+          new Error('{"error":{"code":503,"message":"This model is currently experiencing high demand.","status":"UNAVAILABLE"}}')
+        ).category,
+        'service_unavailable'
+      );
+      assert.equal(
+        classifyGeminiError(new Error('404 NOT_FOUND: models/gemini-unknown is not found')).category,
+        'model_not_found'
+      );
+      assert.equal(
+        classifyGeminiError(new Error('400 INVALID_ARGUMENT: responseSchema invalid')).category,
+        'invalid_request'
+      );
+      assert.equal(
+        classifyGeminiError(new Error('429 RESOURCE_EXHAUSTED: quota exceeded')).category,
+        'rate_limit'
+      );
+      assert.equal(
+        classifyGeminiError(new Error('403 PERMISSION_DENIED: API key not valid')).category,
+        'auth'
+      );
+      assert.equal(
+        classifyGeminiError(new Error('401 UNAUTHENTICATED: missing credentials')).category,
+        'auth'
+      );
+      assert.equal(
+        classifyGeminiError(new DOMException('This operation was aborted', 'AbortError')).category,
+        'timeout'
+      );
+      assert.equal(
+        classifyGeminiError(new Error('500 INTERNAL: unexpected upstream failure')).category,
+        'service_error'
+      );
+
+      const sanitized = sanitizeErrorMessage(
+        'Request failed for https://example.com?key=AIzaSyDummySecretValue1234567890'
+      );
+      assert.ok(!sanitized.includes('AIzaSyDummySecretValue1234567890'));
+      assert.ok(sanitized.includes('[REDACTED]'));
+      return 'Verified all 7 granular error categories (503/404/400/429/auth/timeout/other) & secret sanitization';
+    }
+  );
+
+  await runAsyncTest(
+    '41. Dispatcher reliability: HTTP 503 UNAVAILABLE followed by successful single retry with ~1000ms jittered backoff',
+    async () => {
+      let calls = 0;
+      const result = await executeWithBounded503Retry(
+        async (signal, attempt) => {
+          calls++;
+          assert.equal(signal.aborted, false);
+          if (attempt === 1) {
+            throw Object.assign(new Error('503 UNAVAILABLE: high demand'), { status: 503 });
+          }
+          return '{"ok":true}';
+        },
+        {
+          timeoutMs: 10000,
+          baseBackoffMs: 1000,
+          randomFn: () => 0.5, // exact 1.0x -> 1000ms backoff (within 800..1200ms)
+        }
+      );
+
+      assert.equal(calls, 2);
+      assert.equal(result.attempts, 2);
+      assert.equal(result.retriedOn503, true);
+      assert.equal(result.backoffAppliedMs, 1000);
+      assert.equal(result.value, '{"ok":true}');
+      return `503 recovered on attempt #2 after ${result.backoffAppliedMs}ms jittered backoff`;
+    }
+  );
+
+  await runAsyncTest(
+    '42. Dispatcher reliability: HTTP 503 followed by another 503 stops after 1 retry & activates fallback',
+    async () => {
+      let calls = 0;
+      await assert.rejects(
+        () =>
+          executeWithBounded503Retry(
+            async () => {
+              calls++;
+              throw Object.assign(new Error('503 UNAVAILABLE: high demand'), { status: 503 });
+            },
+            {
+              timeoutMs: 5000,
+              baseBackoffMs: 40,
+              minRetryAttemptBudgetMs: 100,
+              randomFn: () => 0.5,
+            }
+          ),
+        (err: unknown) =>
+          err instanceof DispatcherGeminiError &&
+          err.category === 'service_unavailable' &&
+          err.httpStatus === 503
+      );
+      assert.equal(calls, 2, 'Must execute at most 2 total attempts (1 original + 1 retry)');
+
+      // Verify runDispatcherRecommendation surfaces service_unavailable fallback cleanly
+      const double503Invoker: GeminiInvoker = async () => {
+        throw new DispatcherGeminiError(
+          'service_unavailable',
+          'Gemini model temporarily unavailable (503 UNAVAILABLE).',
+          503
+        );
+      };
+      const fallbackRes = await runDispatcherRecommendation(
+        network,
+        { airportId: 'BOM', startTime: '08:00', durationMinutes: 120 },
+        { apiKey: 'test-mock-key', invoker: double503Invoker }
+      );
+      assert.equal(fallbackRes.aiStatus, 'fallback');
+      assert.equal(fallbackRes.source, 'deterministic_fallback');
+      assert.equal(fallbackRes.fallbackReason, 'service_unavailable');
+      assert.equal(fallbackRes.recommendedActions[0].actionId, 'REC-SPARE-VT-DS17-DS0502');
+      return 'Double 503 capped at 2 attempts and fell back cleanly with fallbackReason=service_unavailable';
+    }
+  );
+
+  await runAsyncTest(
+    '43. Dispatcher reliability: shared deadline exhaustion skips retry & aborts cleanly without budget overrun',
+    async () => {
+      // Case A: Attempt 1 leaves insufficient remaining budget for backoff + retry -> skip retry immediately
+      let callsA = 0;
+      const t0 = Date.now();
+      await assert.rejects(
+        () =>
+          executeWithBounded503Retry(
+            async () => {
+              callsA++;
+              await new Promise((r) => setTimeout(r, 80));
+              throw Object.assign(new Error('503 UNAVAILABLE'), { status: 503 });
+            },
+            {
+              timeoutMs: 200,
+              baseBackoffMs: 100,
+              minRetryAttemptBudgetMs: 100, // 200ms remaining ~120ms < 100+100 -> must NOT retry
+              randomFn: () => 0.5,
+            }
+          ),
+        (err: unknown) =>
+          err instanceof DispatcherGeminiError && err.category === 'service_unavailable'
+      );
+      const elapsedA = Date.now() - t0;
+      assert.equal(callsA, 1, 'Must not attempt retry when remaining shared budget is insufficient');
+      assert.ok(elapsedA < 200, `Expected immediate abort under 200ms budget, took ${elapsedA}ms`);
+
+      // Case B: Attempt 1 fails with 503 -> backoff -> Attempt 2 hangs -> ONE shared AbortController cancels Attempt 2 at timeoutMs (never resets timeout)
+      let callsB = 0;
+      let attempt2Aborted = false;
+      const t1 = Date.now();
+      await assert.rejects(
+        () =>
+          executeWithBounded503Retry(
+            async (signal, attempt) => {
+              callsB++;
+              if (attempt === 1) {
+                await new Promise((r) => setTimeout(r, 40));
+                throw Object.assign(new Error('503 UNAVAILABLE'), { status: 503 });
+              }
+              return await new Promise<string>((_resolve, reject) => {
+                if (signal.aborted) {
+                  attempt2Aborted = true;
+                  reject(new DOMException('Aborted', 'AbortError'));
+                  return;
+                }
+                const onAbort = () => {
+                  attempt2Aborted = true;
+                  reject(new DOMException('Aborted', 'AbortError'));
+                };
+                signal.addEventListener('abort', onAbort, { once: true });
+              });
+            },
+            {
+              timeoutMs: 160,
+              baseBackoffMs: 40,
+              minRetryAttemptBudgetMs: 20,
+              randomFn: () => 0.5,
+            }
+          ),
+        (err: unknown) => err instanceof DispatcherGeminiError && err.category === 'timeout'
+      );
+      const elapsedB = Date.now() - t1;
+      assert.equal(callsB, 2, 'Expected Attempt 2 to start when shared budget remains');
+      assert.equal(attempt2Aborted, true, 'Shared AbortController must cancel Attempt 2 cleanly');
+      assert.ok(
+        elapsedB >= 140 && elapsedB < 260,
+        `Expected shared 160ms deadline to abort Attempt 2 without resetting budget, took ${elapsedB}ms`
+      );
+      return `Shared deadline skipped overrun retry (${elapsedA}ms < 200ms) and aborted Attempt 2 at ${elapsedB}ms (~160ms shared budget)`;
+    }
+  );
+
+  await runAsyncTest(
+    '44. Dispatcher reliability: zero retries on 429, auth (401/403), 400 invalid_request, 404 model_not_found, and timeout',
+    async () => {
+      const nonRetryableCases: Array<{ err: Error; expectedCategory: string }> = [
+        { err: Object.assign(new Error('429 RESOURCE_EXHAUSTED'), { status: 429 }), expectedCategory: 'rate_limit' },
+        { err: Object.assign(new Error('403 PERMISSION_DENIED'), { status: 403 }), expectedCategory: 'auth' },
+        { err: Object.assign(new Error('401 UNAUTHENTICATED'), { status: 401 }), expectedCategory: 'auth' },
+        { err: Object.assign(new Error('400 INVALID_ARGUMENT'), { status: 400 }), expectedCategory: 'invalid_request' },
+        { err: Object.assign(new Error('404 NOT_FOUND'), { status: 404 }), expectedCategory: 'model_not_found' },
+        { err: new DOMException('Aborted', 'AbortError'), expectedCategory: 'timeout' },
+      ];
+
+      for (const tc of nonRetryableCases) {
+        let attempts = 0;
+        await assert.rejects(
+          () =>
+            executeWithBounded503Retry(
+              async () => {
+                attempts++;
+                throw tc.err;
+              },
+              { timeoutMs: 5000, baseBackoffMs: 20, minRetryAttemptBudgetMs: 20 }
+            ),
+          (e: unknown) => e instanceof DispatcherGeminiError && e.category === tc.expectedCategory
+        );
+        assert.equal(attempts, 1, `Expected strictly 1 attempt (no retry) for ${tc.expectedCategory}`);
+      }
+      return 'Verified strictly 1 attempt (zero retries) across 429, 401, 403, 400, 404, and timeout';
+    }
+  );
+
+  await runAsyncTest(
+    '45. Dispatcher prompt optimization: caps feasible <= 8 & rejected <= 4, preserves preference-best & trade-off coverage',
+    async () => {
+      const bomClosure = createAirportClosureEvent(network, 'BOM', parseHHMMToMinutes('08:00'), 120);
+      const bomBase = simulateDisruption(network, bomClosure);
+      const bomRanked = generateAndRankRecoveryOptions(network, bomBase);
+      const originalOrder = bomRanked.rankedOptions.map((o) => o.action.actionId);
+
+      // Test all 5 preferences on BOM (14 feasible, 11 rejected)
+      for (const pref of [
+        'balanced',
+        'minimise_passenger_impact',
+        'minimise_total_delay',
+        'protect_crew_compliance',
+        'avoid_cancellations',
+      ] as const) {
+        const picked = selectPromptFeasibleCandidates(bomRanked.rankedOptions, pref);
+        assert.ok(picked.length <= MAX_PROMPT_FEASIBLE_CANDIDATES, `Picked ${picked.length} > 8 for ${pref}`);
+        assert.equal(picked.length, 8);
+
+        // Must preserve deterministic rank order & must NOT mutate original rankedOptions
+        for (let i = 1; i < picked.length; i++) {
+          assert.ok(picked[i - 1].rank < picked[i].rank);
+        }
+        assert.deepEqual(
+          bomRanked.rankedOptions.map((o) => o.action.actionId),
+          originalOrder,
+          'Prompt candidate selection must never mutate deterministic rankedOptions'
+        );
+
+        // Must include trade-off representatives across all 4 recovery action types present in BOM
+        const types = new Set(picked.map((o) => o.action.type));
+        assert.ok(types.has('deploy_spare_aircraft'));
+        assert.ok(types.has('hold_connection_flight'));
+        assert.ok(types.has('swap_aircraft_rotations'));
+        assert.ok(types.has('cancel_flight_chain'));
+      }
+
+      // On DEL 12:00 (150m), protect_crew_compliance MUST include crew-resolving options (e.g. REC-SPARE-VT-DS18-DS0304)
+      const delClosure = createAirportClosureEvent(network, 'DEL', parseHHMMToMinutes('12:00'), 150);
+      const delBase = simulateDisruption(network, delClosure);
+      const delRanked = generateAndRankRecoveryOptions(network, delBase);
+      const delCrewPicked = selectPromptFeasibleCandidates(
+        delRanked.rankedOptions,
+        'protect_crew_compliance'
+      );
+      assert.ok(delCrewPicked.length <= MAX_PROMPT_FEASIBLE_CANDIDATES);
+      assert.ok(
+        delCrewPicked.some((o) => o.action.actionId === 'REC-SPARE-VT-DS18-DS0304'),
+        'protect_crew_compliance prompt subset must include best crew-resolving spare REC-SPARE-VT-DS18-DS0304'
+      );
+      assert.ok(
+        delCrewPicked.filter((o) => o.comparison.deltas.crewViolationsDelta < 0).length >= 3,
+        'protect_crew_compliance prompt subset must include top 3 crew-resolving candidates'
+      );
+
+      // Rejected candidates capped at <= 4
+      const rejPicked = selectPromptRejectedCandidates(bomRanked.rejectedCandidates);
+      assert.equal(rejPicked.length, MAX_PROMPT_REJECTED_CANDIDATES);
+
+      // Verify full prompt JSON is compact (< 9000 chars vs prior ~16418 chars) and parseable
+      const promptText = buildDispatcherUserPrompt({
+        simulationSummary: buildSimulationSummary(network, bomBase),
+        baseline: bomBase,
+        rankedOptions: bomRanked.rankedOptions,
+        rejectedCandidates: bomRanked.rejectedCandidates,
+        preference: 'balanced',
+      });
+      assert.ok(
+        promptText.length < 9000,
+        `Expected compact prompt under 9000 chars, got ${promptText.length}`
+      );
+      const dataMatch = promptText.match(
+        /<VERIFIED_DETERMINISTIC_DATA>\n([\s\S]+)\n<\/VERIFIED_DETERMINISTIC_DATA>/
+      );
+      assert.ok(dataMatch, 'Prompt must wrap verified payload in VERIFIED_DETERMINISTIC_DATA');
+      const parsedPayload = JSON.parse(dataMatch[1]);
+      assert.equal(parsedPayload.verifiedFeasibleOptions.length, 8);
+      assert.equal(parsedPayload.rejectedCandidates.length, 4);
+
+      return `Compact prompt=${promptText.length} chars (8 feasible across 4 types, 4 rejected; all 5 preferences covered without mutating rankings)`;
+    }
+  );
+
+  await runAsyncTest(
+    '46. Dispatcher reliability: optimized prompt preserves strict KPI validation & deterministic fallback integrity',
+    async () => {
+      // Confirm Gemini output selecting a crew-resolving option on DEL hydrates exact deterministic KPIs
+      const delCrewInvoker: GeminiInvoker = async (params) => {
+        assert.ok(params.userPrompt.includes('REC-SPARE-VT-DS18-DS0304'));
+        return JSON.stringify({
+          situationOverview:
+            'DEL is closed 12:00-14:30 IST for 150 minutes causing 13 delayed flights (1390 minutes total delay) and 3 crew violations.',
+          recommendedActions: [
+            {
+              actionId: 'REC-SPARE-VT-DS18-DS0304',
+              title: 'Deploy spare VT-DS18 from DEL on DS0304',
+              reason: 'Eliminates CR03 crew duty violation and cuts 122 minutes of delay with 0 cancellations.',
+              benefits: ['Resolves 1 crew violation (CR03)', 'Reduces total delay by 122 minutes'],
+              tradeoffs: ['Relies on 45-minute standby crew modelling assumption at DEL'],
+              operationalImpact: {
+                flightsAffected: ['DS0304'],
+                passengerImpact: 'Maintains full schedule with 0 cancelled flights.',
+                crewImpact: 'Resolves CR03 duty breach using assumed standby crew at DEL.',
+                aircraftImpact: 'VT-DS18 operates DS0304 on time while VT-DS03 terminates at DEL.',
+              },
+            },
+          ],
+          alternativeActions: [
+            {
+              actionId: 'REC-HOLD-CX13-DS1102',
+              reasonLessSuitable: 'Saves 37 connecting passengers but resolves 0 crew violations.',
+              keyTradeoff: 'Adds 18 minutes of delay without addressing crew duty breaches.',
+            },
+          ],
+          rejectedActionExplanations: [],
+          dispatcherSummary:
+            'Deploying VT-DS18 on DS0304 protects crew compliance by resolving CR03 and saving 122 minutes of delay without cancellations.',
+          assumptions: ['Standby crew assumption applied for VT-DS18 at DEL.'],
+        });
+      };
+
+      const res = await runDispatcherRecommendation(
+        network,
+        {
+          airportId: 'DEL',
+          startTime: '12:00',
+          durationMinutes: 150,
+          preference: 'protect_crew_compliance',
+        },
+        { apiKey: 'test-mock-key', invoker: delCrewInvoker }
+      );
+
+      assert.equal(res.aiStatus, 'success');
+      assert.equal(res.recommendedActions[0].actionId, 'REC-SPARE-VT-DS18-DS0304');
+      assert.equal(res.recommendedActions[0].verifiedKpiComparison.deltas.crewViolationsDelta, -1);
+      assert.equal(res.recommendedActions[0].verifiedKpiComparison.deltas.totalDelayMinutesDelta, -122);
+      assert.equal(res.recommendedActions[0].verifiedKpiComparison.before.totalDelayMinutes, 1390);
+      assert.equal(res.recommendedActions[0].verifiedKpiComparison.after.totalDelayMinutes, 1268);
+      return 'DEL protect_crew_compliance hydrated REC-SPARE-VT-DS18-DS0304 with exact backend KPIs (-1 crew breach, -122m delay)';
+    }
+  );
+
+  const failed = outcomes.filter((o) => !o.passed);
+  console.log(
+    `\nSummary: ${outcomes.length - failed.length}/${outcomes.length} foundation, simulation, recovery & AI dispatcher checks passed.`
+  );
+  if (failed.length > 0) {
+    process.exit(1);
+  }
 }
+
+void runDispatcherVerificationTests();
+
+

@@ -10,7 +10,7 @@
  *  - POST /api/recovery/compare    : Re-simulate & compare multiple recovery candidates side-by-side
  *  - POST /api/recovery/ranked     : Generate, re-simulate, and transparently rank all feasible options
  *  - GET  /api/dispatcher/status   : Server-side Gemini dispatcher availability (never exposes API keys)
- *  - POST /api/dispatcher/recommend: Reserved for Phase 4 Gemini AI dispatcher endpoint
+ *  - POST /api/dispatcher/recommend: Server-side Gemini AI Dispatcher with deterministic validation & fallback
  *  - Vite dev middleware (development) or static dist/ bundle (production)
  */
 
@@ -30,6 +30,11 @@ import {
   generateRecoveryCandidates,
 } from './src/engine/recovery/index.ts';
 import { isValidHHMM, parseHHMMToMinutes } from './src/engine/time.ts';
+import {
+  DispatcherInputValidationError,
+  GEMINI_DISPATCHER_MODEL,
+  runDispatcherRecommendation,
+} from './src/server/dispatcher/index.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,7 +44,6 @@ const DATASET_PATH = path.resolve(
   __dirname,
   'public/assets/aistudio/flight_network_78529dd1.json'
 );
-const PLANNED_GEMINI_MODEL = 'gemini-4-hydrogen';
 
 interface ScenarioRequestBody {
   airportId?: string | null;
@@ -255,22 +259,32 @@ async function startServer() {
   });
 
   app.get('/api/dispatcher/status', (_req, res) => {
-    const hasKey = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim().length > 0);
+    const rawKey = (process.env.GEMINI_API_KEY ?? '').trim();
+    const hasKey = rawKey.length > 0 && rawKey !== 'MY_GEMINI_API_KEY';
     res.json({
       available: hasKey,
       mode: hasKey ? 'gemini_ready' : 'offline_deterministic_only',
-      model: PLANNED_GEMINI_MODEL,
+      model: GEMINI_DISPATCHER_MODEL,
       message: hasKey
-        ? 'Server-side Gemini API key detected. Ready for AI dispatcher integration once the simulation engine is active.'
-        : 'Running in deterministic-only mode. The simulator operates completely without Gemini when no API key is configured.',
+        ? `Server-side Gemini AI Dispatcher active (${GEMINI_DISPATCHER_MODEL}) with deterministic validation and automatic fallback.`
+        : 'Running in deterministic fallback mode. Configure server-side GEMINI_API_KEY to enable Gemini reasoning; deterministic simulation and recovery remain fully operational.',
     });
   });
 
-  app.post('/api/dispatcher/recommend', (_req, res) => {
-    res.status(501).json({
-      error:
-        'AI dispatcher recommendations are scheduled for Phase 4 after the deterministic recovery engine is verified.',
-    });
+  app.post('/api/dispatcher/recommend', async (req, res) => {
+    try {
+      const bundle = loadValidatedDatasetFromDisk();
+      const recommendation = await runDispatcherRecommendation(bundle.network, req.body);
+      res.json(recommendation);
+    } catch (error) {
+      if (error instanceof DispatcherInputValidationError) {
+        res.status(error.statusCode).json({ error: error.message });
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : 'Unable to generate dispatcher recommendation.';
+      res.status(500).json({ error: message });
+    }
   });
 
   const isProd = process.env.NODE_ENV === 'production';

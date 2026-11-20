@@ -81,9 +81,9 @@ const ARCHITECTURE_MODULES: ModuleBlueprint[] = [
     step: '09',
     name: 'AI Dispatcher Integration (Server-Side Gemini)',
     authority: 'Server-Side AI Advisory',
-    status: 'Interface Defined (Next Phase)',
+    status: 'Implemented & Verified',
     responsibility:
-      'Receives structured deterministic summaries and pre-validated recovery candidates; returns an actionId and qualitative trade-off analysis without computing numbers.',
+      'Receives structured deterministic summaries and evaluated recovery candidates; returns preference-aware actionIds and trade-off analysis strictly validated against backend truth with automatic deterministic fallback.',
   },
 ];
 
